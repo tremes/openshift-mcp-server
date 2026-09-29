@@ -2,11 +2,14 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 	"github.com/containers/kubernetes-mcp-server/pkg/oauth"
@@ -210,6 +213,14 @@ func (p *tokenExchangingProvider) Close() {
 
 func (p *tokenExchangingProvider) AnyTargetHasGVKs(ctx context.Context, gvks []schema.GroupVersionKind) bool {
 	return p.provider.AnyTargetHasGVKs(ctx, gvks)
+}
+
+func (p *tokenExchangingProvider) AnyTargetGetResourceInstance(ctx context.Context, gvk schema.GroupVersionKind, namespace, name string) (*unstructured.Unstructured, error) {
+	instanceProvider, ok := p.provider.(api.ResourceInstanceProvider)
+	if !ok {
+		return nil, errors.New("named resource lookup is not supported by this provider")
+	}
+	return instanceProvider.AnyTargetGetResourceInstance(ctx, gvk, namespace, name)
 }
 
 func (p *tokenExchangingProvider) IsTargetCompatibilityToolFiltersEnabled() bool {

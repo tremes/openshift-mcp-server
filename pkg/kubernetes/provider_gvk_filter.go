@@ -2,10 +2,16 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/klogutil"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 )
@@ -94,4 +100,59 @@ func targetHasGVKs(ctx context.Context, logger klog.Logger, mgr *Manager, gvks [
 		return true
 	}
 	return hasGVKs
+}
+
+// AnyTargetGetResourceInstance returns the first matching named instance on any target.
+// An empty namespace is valid only for cluster-scoped resources.
+func (f *ProviderGVKFilter) AnyTargetGetResourceInstance(ctx context.Context, gvk schema.GroupVersionKind, namespace, name string) (*unstructured.Unstructured, error) {
+	if name == "" {
+		return nil, errors.New("resource name is required")
+	}
+
+	mgrs, err := f.managerProvider.GetTargetManagers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var lookupErrors []error
+	for _, mgr := range mgrs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		k, err := mgr.Derived(ctx)
+		if err != nil {
+			lookupErrors = append(lookupErrors, err)
+			continue
+		}
+
+		mapping, err := k.RESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+		if meta.IsNoMatchError(err) {
+			continue
+		}
+		if err != nil {
+			lookupErrors = append(lookupErrors, err)
+			continue
+		}
+		switch mapping.Scope.Name() {
+		case meta.RESTScopeNameNamespace:
+			if namespace == "" {
+				return nil, fmt.Errorf("namespace is required for namespaced resource %s", gvk)
+			}
+		case meta.RESTScopeNameRoot:
+			if namespace != "" {
+				return nil, fmt.Errorf("namespace must be empty for cluster-scoped resource %s", gvk)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported scope for resource %s", gvk)
+		}
+
+		instance, err := k.DynamicClient().Resource(mapping.Resource).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			return instance, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			lookupErrors = append(lookupErrors, err)
+		}
+	}
+	return nil, errors.Join(lookupErrors...)
 }

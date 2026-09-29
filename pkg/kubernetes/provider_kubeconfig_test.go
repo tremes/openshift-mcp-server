@@ -9,8 +9,11 @@ import (
 	"time"
 
 	"github.com/containers/kubernetes-mcp-server/internal/test"
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/stretchr/testify/suite"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -180,6 +183,52 @@ func (s *ProviderKubeconfigTestSuite) TestAnyTargetHasGVKsAcrossContexts() {
 		s.True(has, "Expected Project GVK from the OpenShift target")
 		s.Less(time.Since(start), 2*time.Second, "Expected to return before the hanging target's discovery timeout")
 	})
+}
+
+func (s *ProviderKubeconfigTestSuite) TestGetNamedResourceAcrossContexts() {
+	withoutCR := test.NewMockServer()
+	s.T().Cleanup(withoutCR.Close)
+	withoutCR.Handle(test.NewDiscoveryClientHandler())
+
+	withCR := test.NewMockServer()
+	s.T().Cleanup(withCR.Close)
+	withCR.Handle(test.NewDiscoveryClientHandler(metav1.APIResourceList{
+		GroupVersion: "example.com/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "clusterwidgets", Kind: "ClusterWidget", Namespaced: false, Verbs: metav1.Verbs{"get"}},
+		},
+	}))
+	withCR.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/apis/example.com/v1/clusterwidgets/global" {
+			test.WriteObject(w, &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "example.com/v1",
+				"kind":       "ClusterWidget",
+				"metadata":   map[string]any{"name": "global"},
+			}})
+		}
+	}))
+
+	provider, err := NewProvider(s.T().Context(), func() *config.Config {
+		c := config.New()
+		c.KubeConfig.SetForTest(kubeconfigForMockServers(s.T(), "without", map[string]*test.MockServer{
+			"without": withoutCR,
+			"with":    withCR,
+		}))
+		return c
+	}())
+	s.Require().NoError(err)
+	s.T().Cleanup(provider.Close)
+	instanceProvider, ok := provider.(api.ResourceInstanceProvider)
+	s.Require().True(ok)
+
+	instance, err := instanceProvider.AnyTargetGetResourceInstance(
+		s.T().Context(),
+		schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "ClusterWidget"},
+		"", "global",
+	)
+	s.Require().NoError(err)
+	s.Require().NotNil(instance)
+	s.Equal("global", instance.GetName())
 }
 
 func kubeconfigForMockServers(t *testing.T, currentContext string, servers map[string]*test.MockServer) string {

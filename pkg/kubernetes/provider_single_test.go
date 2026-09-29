@@ -2,11 +2,16 @@ package kubernetes
 
 import (
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/containers/kubernetes-mcp-server/internal/test"
+	"github.com/containers/kubernetes-mcp-server/pkg/api"
 	"github.com/containers/kubernetes-mcp-server/pkg/config"
 	"github.com/stretchr/testify/suite"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -63,6 +68,88 @@ func (s *ProviderSingleTestSuite) TestWithNonOpenShiftGVK() {
 			{Group: "nonexistent.example.com", Version: "v1", Kind: "Foo"},
 		})
 		s.False(hasGVK, "Expected provider to report no nonexistent GVK")
+	})
+}
+
+func (s *ProviderSingleTestSuite) TestGetNamedCustomResourceInstance() {
+	s.mockServer.ResetHandlers()
+	s.mockServer.Handle(test.NewDiscoveryClientHandler(metav1.APIResourceList{
+		GroupVersion: "example.com/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: metav1.Verbs{"get"}},
+			{Name: "clusterwidgets", Kind: "ClusterWidget", Namespaced: false, Verbs: metav1.Verbs{"get"}},
+		},
+	}))
+	s.mockServer.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apis/example.com/v1/namespaces/demo/widgets/active":
+			test.WriteObject(w, &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "example.com/v1",
+				"kind":       "Widget",
+				"metadata":   map[string]any{"name": "active", "namespace": "demo"},
+				"spec":       map[string]any{"enabled": true},
+			}})
+		case "/apis/example.com/v1/clusterwidgets/global":
+			test.WriteObject(w, &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "example.com/v1",
+				"kind":       "ClusterWidget",
+				"metadata":   map[string]any{"name": "global"},
+			}})
+		case "/apis/example.com/v1/namespaces/demo/widgets/missing":
+			w.WriteHeader(http.StatusNotFound)
+			test.WriteObject(w, &metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status: metav1.StatusFailure, Reason: metav1.StatusReasonNotFound, Code: http.StatusNotFound,
+			})
+		case "/apis/example.com/v1/namespaces/demo/widgets/forbidden":
+			w.WriteHeader(http.StatusForbidden)
+			test.WriteObject(w, &metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status: metav1.StatusFailure, Reason: metav1.StatusReasonForbidden, Code: http.StatusForbidden,
+			})
+		}
+	}))
+
+	instanceProvider, ok := s.provider.(api.ResourceInstanceProvider)
+	s.Require().True(ok)
+	widget := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}
+	clusterWidget := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "ClusterWidget"}
+
+	s.Run("returns attributes of a namespaced instance", func() {
+		instance, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), widget, "demo", "active")
+		s.Require().NoError(err)
+		s.Require().NotNil(instance)
+		enabled, found, err := unstructured.NestedBool(instance.Object, "spec", "enabled")
+		s.Require().NoError(err)
+		s.True(found && enabled)
+	})
+	s.Run("returns nil for a missing instance", func() {
+		instance, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), widget, "demo", "missing")
+		s.Require().NoError(err)
+		s.Nil(instance)
+	})
+	s.Run("requires a namespace for namespaced resources", func() {
+		_, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), widget, "", "active")
+		s.ErrorContains(err, "namespace is required")
+	})
+	s.Run("returns a cluster-scoped instance without a namespace", func() {
+		instance, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), clusterWidget, "", "global")
+		s.Require().NoError(err)
+		s.Require().NotNil(instance)
+		s.Equal("global", instance.GetName())
+	})
+	s.Run("rejects a namespace for cluster-scoped resources", func() {
+		_, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), clusterWidget, "demo", "global")
+		s.ErrorContains(err, "namespace must be empty")
+	})
+	s.Run("requires a resource name", func() {
+		_, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), widget, "demo", "")
+		s.ErrorContains(err, "resource name is required")
+	})
+	s.Run("returns lookup errors rather than reporting absence", func() {
+		_, err := instanceProvider.AnyTargetGetResourceInstance(s.T().Context(), widget, "demo", "forbidden")
+		s.Require().Error(err)
+		s.True(apierrors.IsForbidden(err))
 	})
 }
 
